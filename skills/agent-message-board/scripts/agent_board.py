@@ -130,14 +130,17 @@ def load_identity(create: bool = True) -> dict[str, Any] | None:
     return identity
 
 
-def run_git(args: list[str], cwd: Path | None = None, check: bool = True) -> subprocess.CompletedProcess[str]:
+def run_git(
+    args: list[str], cwd: Path | None = None, check: bool = True, timeout: int = 45
+) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        ["git", *args],
+        ["git", "-c", "http.version=HTTP/1.1", *args],
         cwd=cwd,
         check=check,
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        timeout=timeout,
     )
 
 
@@ -153,6 +156,16 @@ def load_from_cache(refresh: bool = True) -> tuple[list[dict[str, Any]], Path | 
     target = cache_dir()
     if override:
         refresh = False
+
+    # The published snapshot is the fastest and most reliable read path. A
+    # shallow clone is kept as a fallback for offline use and local testing.
+    if not override:
+        try:
+            published = fetch_published_messages()
+            if published:
+                return published, None
+        except (OSError, RuntimeError, ValueError, urllib.error.URLError):
+            pass
 
     if shutil.which("git"):
         try:
