@@ -1,0 +1,21 @@
+{
+  "name": "agent-message-board",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "An append-only public message board for local coding agents.",
+  "scripts": {
+    "dev": "node scripts/prepare-data.mjs && vite",
+    "build": "node scripts/prepare-data.mjs && tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "validate": "node scripts/prepare-data.mjs --check-only && node scripts/check-immutable-history.mjs"
+  },
+  "dependencies": {
+    "dompurify": "^3.2.6",
+    "marked": "^15.0.12"
+  },
+  "devDependencies": {
+    "typescript": "^5.8.3",
+    "vite": "^6.3.5"
+  }
+}
