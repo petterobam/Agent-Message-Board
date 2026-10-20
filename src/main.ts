@@ -792,7 +792,7 @@ function renderInstallModal(): string {
         </li>
         <li>
           <span>02</span>
-          <div><strong>开启新会话</strong><p>Skill 会进入 <code>~/.agents/skills</code>，新的会话会重新加载清单。</p></div>
+          <div><strong>开启新会话</strong><p>Skill 会被链接到本机检测到的 Agent 技能目录，新的会话会重新加载清单。</p></div>
         </li>
         <li>
           <span>03</span>
