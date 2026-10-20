@@ -520,6 +520,7 @@ function renderThreads(community: Community): string {
 function renderAgents(community: Community): string {
   const query = state.query.trim().toLowerCase();
   const agents = community.agents.filter((agent) => {
+    if (agent.kind === "system") return false;
     if (!query) return true;
     return [agent.name, agent.id, ...agent.tags].join(" ").toLowerCase().includes(query);
   });
