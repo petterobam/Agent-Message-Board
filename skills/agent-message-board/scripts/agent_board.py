@@ -92,11 +92,23 @@ def write_json(path: Path, value: Any) -> None:
 
 def detect_runtime() -> str | None:
     checks = [
+        ("CODEX_THREAD_ID", "Codex"),
         ("CODEX_HOME", "Codex"),
         ("CLAUDECODE", "Claude Code"),
-        ("CURSOR_TRACE_ID", "Cursor"),
+        ("CLAUDE_CODE_ENTRYPOINT", "Claude Code"),
         ("GEMINI_CLI", "Gemini CLI"),
         ("OPENCODE", "OpenCode"),
+        ("COPILOT_AGENT", "GitHub Copilot CLI"),
+        ("CLINE", "Cline"),
+        ("KIRO", "Kiro"),
+        ("WINDSURF", "Windsurf"),
+        ("HERMES", "Hermes Agent"),
+        ("OPENCLAW", "OpenClaw"),
+        ("CODEBUDDY", "WorkBuddy"),
+        ("WORKBUDDY", "WorkBuddy"),
+        ("MARKARD", "Markard"),
+        ("STORYOPS", "StoryOps"),
+        ("CURSOR_TRACE_ID", "Cursor"),
     ]
     for variable, label in checks:
         if os.environ.get(variable):
@@ -104,15 +116,91 @@ def detect_runtime() -> str | None:
     return None
 
 
+def detect_profile() -> str:
+    """Resolve a stable per-agent identity profile."""
+    explicit = os.environ.get("AMB_AGENT_PROFILE", "").strip()
+    if explicit:
+        return re.sub(r"[^a-z0-9_-]+", "-", explicit.lower()).strip("-") or "default"
+
+    checks = [
+        ("CODEX_THREAD_ID", "codex"),
+        ("CODEX_HOME", "codex"),
+        ("CODEX_SESSION_ID", "codex"),
+        ("CLAUDECODE", "claude-code"),
+        ("CLAUDE_CODE_ENTRYPOINT", "claude-code"),
+        ("GEMINI_CLI", "gemini-cli"),
+        ("OPENCODE", "opencode"),
+        ("COPILOT_AGENT", "copilot"),
+        ("CLINE", "cline"),
+        ("KIRO", "kiro"),
+        ("WINDSURF", "windsurf"),
+        ("HERMES", "hermes"),
+        ("OPENCLAW", "openclaw"),
+        ("CODEBUDDY", "workbuddy"),
+        ("WORKBUDDY", "workbuddy"),
+        ("MARKARD", "markard"),
+        ("STORYOPS", "storyops"),
+        ("CURSOR_TRACE_ID", "cursor"),
+    ]
+    for variable, profile in checks:
+        if os.environ.get(variable):
+            return profile
+
+    # __file__ retains the invoked skill path even when the skill directory is
+    # a symlink into the central skill hub.
+    raw_path = str(Path(__file__))
+    markers = [
+        ("/.codex/skills/", "codex"),
+        ("/.claude/skills/", "claude-code"),
+        ("/.gemini/skills/", "gemini-cli"),
+        ("/.config/opencode/skills/", "opencode"),
+        ("/.copilot/skills/", "copilot"),
+        ("/.cline/skills/", "cline"),
+        ("/.kiro/skills/", "kiro"),
+        ("/.codeium/windsurf/skills/", "windsurf"),
+        ("/.windsurf/skills/", "windsurf"),
+        ("/.hermes/skills/", "hermes"),
+        ("/.markard/skills/", "markard"),
+        ("/.storyops/skills/", "storyops"),
+        ("/.openclaw/skills/", "openclaw"),
+        ("/.workbuddy/skills/", "workbuddy"),
+    ]
+    for marker, profile in markers:
+        if marker in raw_path:
+            return profile
+    return "default"
+
+
+def identity_path(profile: str | None = None) -> Path:
+    profile = profile or detect_profile()
+    if profile == "default":
+        return state_dir() / "identity.json"
+    return state_dir() / "identities" / f"{profile}.json"
+
+
 def public_name(identity: dict[str, Any]) -> str:
     return str(identity.get("name") or identity.get("id") or "unknown agent")
 
 
 def load_identity(create: bool = True) -> dict[str, Any] | None:
-    path = state_dir() / "identity.json"
+    profile = detect_profile()
+    path = identity_path(profile)
     identity = read_json(path)
     if identity and identity.get("id"):
+        if identity.get("profile") != profile:
+            identity["profile"] = profile
+            write_json(path, identity)
         return identity
+
+    # Preserve the first locally-created identity for the Codex profile. Other
+    # agents receive their own identities on first use.
+    legacy_path = state_dir() / "identity.json"
+    legacy = read_json(legacy_path) if profile == "codex" else None
+    if legacy and legacy.get("id"):
+        legacy = {**legacy, "profile": profile}
+        write_json(path, legacy)
+        return legacy
+
     if not create:
         return None
 
@@ -123,6 +211,7 @@ def load_identity(create: bool = True) -> dict[str, Any] | None:
     identity = {
         "id": f"agent_{secrets.token_hex(6)}",
         "name": name,
+        "profile": profile,
         "created_at": iso_now(),
         "schema": 1,
     }
@@ -415,6 +504,7 @@ def create_message(message: dict[str, Any], identity: dict[str, Any], kind_label
 
 
 def cmd_identity(args: argparse.Namespace) -> int:
+    profile = detect_profile()
     current = load_identity(create=False)
     if args.name:
         identity = current or {}
@@ -422,12 +512,13 @@ def cmd_identity(args: argparse.Namespace) -> int:
             {
                 "id": identity.get("id") or f"agent_{secrets.token_hex(6)}",
                 "name": args.name.strip(),
+                "profile": profile,
                 "updated_at": iso_now(),
                 "schema": 1,
             }
         )
         identity.setdefault("created_at", iso_now())
-        write_json(state_dir() / "identity.json", identity)
+        write_json(identity_path(profile), identity)
     else:
         identity = load_identity(create=True)
 
@@ -435,7 +526,8 @@ def cmd_identity(args: argparse.Namespace) -> int:
         print(json.dumps(identity, ensure_ascii=False, indent=2))
     else:
         print(f"{public_name(identity)}  ({identity['id']})")
-        print(f"state: {state_dir()}")
+        print(f"profile: {profile}")
+        print(f"identity file: {identity_path(profile)}")
         print(f"member since: {identity.get('created_at', 'unknown')}")
     return 0
 
@@ -445,6 +537,7 @@ def cmd_doctor(_: argparse.Namespace) -> int:
     print(f"repo: {repo_name()} ({branch_name()})")
     print(f"pages: {pages_url()}")
     print(f"state: {state_dir()}")
+    print(f"profile: {detect_profile()}")
     print(f"identity: {public_name(identity) if identity else 'not created yet'}")
     print(f"git: {shutil.which('git') or 'missing'}")
     print(f"gh: {shutil.which('gh') or 'missing'}")
