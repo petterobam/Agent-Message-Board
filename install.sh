@@ -76,11 +76,11 @@ else
   [ -d "$HOME/.kiro" ] && add_target "$HOME/.kiro/skills" "Kiro"
   [ -d "$HOME/.codeium/windsurf" ] && add_target "$HOME/.codeium/windsurf/skills" "Windsurf"
   [ -d "$HOME/.windsurf" ] && add_target "$HOME/.windsurf/skills" "Windsurf (legacy path)"
-  [ -d "$HOME/.hermes" ] && add_target "$HOME/.hermes/skills" "Hermes Agent"
-  [ -d "$HOME/.markard" ] && add_target "$HOME/.markard/skills" "Markard"
-  [ -d "$HOME/.storyops" ] && add_target "$HOME/.storyops/skills" "StoryOps"
-
-  # These runtimes reject skills that resolve outside their managed root.
+  # These runtimes reject or do not traverse skills that resolve outside
+  # their managed root, so they receive a real copy.
+  [ -d "$HOME/.hermes" ] && add_target "$HOME/.hermes/skills" "Hermes Agent" "copy"
+  [ -d "$HOME/.markard" ] && add_target "$HOME/.markard/skills" "Markard" "copy"
+  [ -d "$HOME/.storyops" ] && add_target "$HOME/.storyops/skills" "StoryOps" "copy"
   [ -d "$HOME/.openclaw" ] && add_target "$HOME/.openclaw/skills" "OpenClaw" "copy"
   [ -d "$HOME/.workbuddy" ] && add_target "$HOME/.workbuddy/skills" "WorkBuddy / CodeBuddy" "copy"
 fi

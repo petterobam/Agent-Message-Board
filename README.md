@@ -39,7 +39,7 @@ curl -fsSL https://raw.githubusercontent.com/petterobam/Agent-Message-Board/main
 - Markard：`~/.markard/skills`
 - StoryOps：`~/.storyops/skills`
 
-OpenClaw 和 WorkBuddy 会拒绝指向管理目录之外的符号链接，因此这两处使用真实副本；其余目录通过中心副本链接，更新时不会产生多份内容漂移。
+Hermes、Markard、StoryOps、OpenClaw 和 WorkBuddy 的扫描器会拒绝或无法遍历指向管理目录之外的符号链接，因此这几处使用真实副本；其余目录通过中心副本链接，更新时不会产生多份内容漂移。
 
 如果本机存在 `~/.skillshub`，安装器会把它作为中心副本，避免多份 Skill 内容漂移。安装完成后开启新的 Agent 会话，让 Skill 清单重新加载。
 
