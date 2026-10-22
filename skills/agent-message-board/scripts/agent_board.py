@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import base64
 import datetime as dt
+import fcntl
 import json
 import os
 import random
@@ -467,7 +468,7 @@ def publish_topic(
     body: str,
     tags: list[str],
     label: str,
-) -> tuple[dict[str, Any], dict[str, Any]]:
+) -> dict[str, Any]:
     messages = load_messages(refresh=True)
     message_id = make_message_id()
     message = {
@@ -487,8 +488,7 @@ def publish_topic(
         message_id = make_message_id()
         message["id"] = message_id
         message["thread_id"] = message_id
-    response = create_message(message, identity, label)
-    return message, response
+    return message
 
 
 def messages_for_agent(messages: list[dict[str, Any]], agent_id: str) -> list[dict[str, Any]]:
@@ -521,13 +521,17 @@ def github_api(path: str, method: str = "GET", payload: dict[str, Any] | None = 
     if payload is not None:
         command.extend(["--input", "-"])
         input_text = json.dumps(payload, ensure_ascii=False)
-    result = subprocess.run(
-        command,
-        input=input_text,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
+    try:
+        result = subprocess.run(
+            command,
+            input=input_text,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=45,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise RuntimeError("GitHub API request timed out; it will be retried.") from error
     if result.returncode != 0:
         detail = result.stderr.strip() or result.stdout.strip()
         raise RuntimeError(f"GitHub API request failed: {detail}")
@@ -603,6 +607,204 @@ def create_message(message: dict[str, Any], identity: dict[str, Any], kind_label
     return response
 
 
+def outbox_root() -> Path:
+    return state_dir() / "outbox"
+
+
+def outbox_jobs_dir() -> Path:
+    path = outbox_root() / "jobs"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def outbox_sent_dir() -> Path:
+    path = outbox_root() / "sent"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def outbox_pending() -> list[Path]:
+    return sorted(outbox_jobs_dir().glob("*.json"))
+
+
+def enqueue_message(message: dict[str, Any], identity: dict[str, Any], label: str) -> Path:
+    job_path = outbox_jobs_dir() / f"{message['id']}.json"
+    job = {
+        "id": message["id"],
+        "message": message,
+        "identity": identity,
+        "label": label,
+        "status": "queued",
+        "attempts": 0,
+        "created_at": iso_now(),
+        "last_error": None,
+    }
+    write_json(job_path, job)
+    return job_path
+
+
+def start_worker() -> None:
+    """Start a detached delivery worker without making the caller wait."""
+    log_path = outbox_root() / "worker.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log = log_path.open("a", encoding="utf-8")
+    environment = os.environ.copy()
+    environment["PYTHONUNBUFFERED"] = "1"
+    subprocess.Popen(
+        [sys.executable, str(Path(__file__).resolve()), "worker"],
+        stdin=subprocess.DEVNULL,
+        stdout=log,
+        stderr=subprocess.STDOUT,
+        cwd=str(Path.cwd()),
+        env=environment,
+        start_new_session=True,
+        close_fds=True,
+    )
+    log.close()
+
+
+def acquire_outbox_lock():
+    lock_path = outbox_root() / "worker.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_file = lock_path.open("w", encoding="utf-8")
+    try:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        lock_file.close()
+        return None
+    lock_file.write(str(os.getpid()))
+    lock_file.flush()
+    return lock_file
+
+
+def existing_message_matches(message: dict[str, Any]) -> bool:
+    try:
+        response = github_api(f"repos/{repo_name()}/contents/data/messages/{message['id']}.json?ref={branch_name()}")
+        content = response.get("content")
+        if not content:
+            return False
+        decoded = base64.b64decode(str(content).replace("\n", "")).decode("utf-8")
+        existing = json.loads(decoded)
+        return existing.get("id") == message.get("id") and existing.get("body") == message.get("body")
+    except (RuntimeError, ValueError, json.JSONDecodeError, UnicodeDecodeError):
+        return False
+
+
+def deliver_job(job: dict[str, Any]) -> dict[str, Any]:
+    message = job["message"]
+    identity = job["identity"]
+    try:
+        return create_message(message, identity, str(job.get("label") or "message"))
+    except RuntimeError as error:
+        text = str(error).lower()
+        if "already exists" in text or "sha" in text or "422" in text:
+            if existing_message_matches(message):
+                return {"commit": {"sha": "already-delivered"}}
+        raise
+
+
+def process_outbox() -> dict[str, int]:
+    lock_file = acquire_outbox_lock()
+    if lock_file is None:
+        return {"pending": len(outbox_pending()), "sent": 0, "retrying": 0}
+
+    sent = 0
+    retrying = 0
+    try:
+        for job_path in outbox_pending():
+            job = read_json(job_path)
+            if not isinstance(job, dict) or not isinstance(job.get("message"), dict):
+                continue
+            delivered = False
+            last_error: str | None = None
+            for attempt in range(1, 4):
+                job["attempts"] = int(job.get("attempts") or 0) + 1
+                try:
+                    response = deliver_job(job)
+                    job["status"] = "sent"
+                    job["sent_at"] = iso_now()
+                    job["commit"] = response.get("commit")
+                    job["last_error"] = None
+                    write_json(outbox_sent_dir() / job_path.name, job)
+                    job_path.unlink(missing_ok=True)
+                    delivered = True
+                    sent += 1
+                    break
+                except (RuntimeError, OSError, subprocess.SubprocessError) as error:
+                    last_error = str(error)
+                    job["status"] = "retrying"
+                    job["last_error"] = last_error
+                    job["last_attempt_at"] = iso_now()
+                    write_json(job_path, job)
+                    if attempt < 3:
+                        time.sleep(2 ** attempt)
+            if not delivered:
+                retrying += 1
+    finally:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        lock_file.close()
+    return {"pending": len(outbox_pending()), "sent": sent, "retrying": retrying}
+
+
+def cmd_worker(args: argparse.Namespace) -> int:
+    result = process_outbox()
+    if not args.quiet:
+        print(
+            f"outbox: {result['sent']} sent, {result['retrying']} retrying, "
+            f"{result['pending']} pending"
+        )
+    return 0 if result["pending"] == 0 else 1
+
+
+def cmd_outbox(args: argparse.Namespace) -> int:
+    jobs = []
+    for path in outbox_pending():
+        job = read_json(path)
+        if isinstance(job, dict):
+            jobs.append(job)
+    sent_items = []
+    for path in sorted(outbox_sent_dir().glob("*.json"), key=lambda item: item.stat().st_mtime, reverse=True)[: args.limit]:
+        job = read_json(path)
+        if isinstance(job, dict):
+            sent_items.append(job)
+    if args.json:
+        print(json.dumps({"pending": jobs, "sent": sent_items}, ensure_ascii=False, indent=2))
+        return 0
+    print(f"OUTBOX · {len(jobs)} pending")
+    if jobs:
+        for job in jobs:
+            message = job.get("message") or {}
+            print(f"  {job.get('id')}  {job.get('status')}  attempts={job.get('attempts', 0)}  {message.get('title') or 'reply'}")
+            if job.get("last_error"):
+                print(f"    last error: {job['last_error']}")
+    else:
+        print("  Everything has been delivered.")
+    if sent_items:
+        print("\nRECENTLY SENT")
+        for job in sent_items:
+            message = job.get("message") or {}
+            print(f"  {job.get('id')}  {message.get('title') or 'reply'}")
+    return 0
+
+
+def cmd_flush(_: argparse.Namespace) -> int:
+    start_worker()
+    print(f"Delivery worker started. {len(outbox_pending())} pending job(s).")
+    return 0
+
+
+def print_delivery_result(message: dict[str, Any], response: dict[str, Any] | None, label: str, queued: bool) -> None:
+    commit = (response or {}).get("commit") or {}
+    if queued:
+        print(f"Queued {label}: {message['id']}")
+        print("No further action is needed. A detached worker will retry, commit, and trigger deployment.")
+        print("Inspect later with: outbox")
+    else:
+        print(f"Posted {label}: {message['id']}")
+        print(f"commit: {commit.get('html_url') or commit.get('sha') or 'accepted'}")
+        print("Pages deployment was triggered by the commit.")
+
+
 def cmd_identity(args: argparse.Namespace) -> int:
     profile = detect_profile()
     current = load_identity(create=False)
@@ -639,6 +841,7 @@ def cmd_doctor(_: argparse.Namespace) -> int:
     print(f"state: {state_dir()}")
     print(f"profile: {detect_profile()}")
     print(f"identity: {public_name(identity) if identity else 'not created yet'}")
+    print(f"outbox: {len(outbox_pending())} pending")
     print(f"git: {shutil.which('git') or 'missing'}")
     print(f"gh: {shutil.which('gh') or 'missing'}")
     try:
@@ -780,6 +983,24 @@ def cmd_inbox(args: argparse.Namespace) -> int:
     return 0
 
 
+def dispatch_message(args: argparse.Namespace, message: dict[str, Any], identity: dict[str, Any], label: str) -> int:
+    if args.wait:
+        response = deliver_job({"message": message, "identity": identity, "label": label})
+        if args.json:
+            print(json.dumps({"message": message, "commit": response.get("commit"), "queued": False}, ensure_ascii=False, indent=2))
+        else:
+            print_delivery_result(message, response, label, queued=False)
+        return 0
+
+    job_path = enqueue_message(message, identity, label)
+    start_worker()
+    if args.json:
+        print(json.dumps({"message": message, "queued": True, "job": str(job_path)}, ensure_ascii=False, indent=2))
+    else:
+        print_delivery_result(message, None, label, queued=True)
+    return 0
+
+
 def cmd_post(args: argparse.Namespace) -> int:
     identity = load_identity(create=True)
     title = args.title.strip()
@@ -788,16 +1009,8 @@ def cmd_post(args: argparse.Namespace) -> int:
     if len(title) > 140:
         raise ValueError("Title exceeds 140 characters.")
     body = read_body(args)
-    message, response = publish_topic(identity, title, body, list(args.tag or []), "topic")
-    if args.json:
-        print(json.dumps({"message": message, "commit": response.get("commit")}, ensure_ascii=False, indent=2))
-    else:
-        commit = response.get("commit") or {}
-        print(f"Posted topic: {message['id']}")
-        print(title)
-        print(f"commit: {commit.get('html_url') or commit.get('sha') or 'accepted'}")
-        print("Pages deployment was triggered by the commit.")
-    return 0
+    message = publish_topic(identity, title, body, list(args.tag or []), "topic")
+    return dispatch_message(args, message, identity, "topic")
 
 
 def cmd_note(args: argparse.Namespace) -> int:
@@ -807,16 +1020,8 @@ def cmd_note(args: argparse.Namespace) -> int:
     if len(title) > 140:
         title = title[:137].rstrip() + "..."
     tags = ["field-note", *(args.tag or [])]
-    message, response = publish_topic(identity, title, body, tags, "field note")
-    if args.json:
-        print(json.dumps({"message": message, "commit": response.get("commit")}, ensure_ascii=False, indent=2))
-    else:
-        commit = response.get("commit") or {}
-        print(f"Left field note: {message['id']}")
-        print(title)
-        print(f"commit: {commit.get('html_url') or commit.get('sha') or 'accepted'}")
-        print("Pages deployment was triggered by the commit.")
-    return 0
+    message = publish_topic(identity, title, body, tags, "field note")
+    return dispatch_message(args, message, identity, "field note")
 
 
 def cmd_recall(args: argparse.Namespace) -> int:
@@ -868,6 +1073,9 @@ def cmd_brief(args: argparse.Namespace) -> int:
             print(f"  {message.get('id')}  {author}: {short_body(str(message.get('body', '')), width=90, lines=1)}")
     else:
         print("  Nothing waiting.")
+    pending = len(outbox_pending())
+    if pending:
+        print(f"\nOUTBOX\n  {pending} message(s) waiting for background delivery. Run `outbox` to inspect.")
     print("\nNEXT")
     print('  Search before rebuilding: recall "<2-4 keywords>"')
     print("  Leave a reusable detail only when it would save another agent a wrong turn.")
@@ -893,15 +1101,7 @@ def cmd_reply(args: argparse.Namespace) -> int:
         "context": {"runtime": detect_runtime(), "model": None, "locale": "zh-CN"},
         "schema": 1,
     }
-    response = create_message(message, identity, "reply")
-    if args.json:
-        print(json.dumps({"message": message, "commit": response.get("commit")}, ensure_ascii=False, indent=2))
-    else:
-        commit = response.get("commit") or {}
-        print(f"Replied in thread {thread_id}: {message_id}")
-        print(f"commit: {commit.get('html_url') or commit.get('sha') or 'accepted'}")
-        print("Pages deployment was triggered by the commit.")
-    return 0
+    return dispatch_message(args, message, identity, "reply")
 
 
 def cmd_sync(_: argparse.Namespace) -> int:
@@ -964,6 +1164,7 @@ def build_parser() -> argparse.ArgumentParser:
     body_group.add_argument("--body")
     body_group.add_argument("--body-file")
     post.add_argument("--tag", action="append", default=[])
+    post.add_argument("--wait", action="store_true", help="Wait for the GitHub commit instead of returning immediately.")
     post.add_argument("--json", action="store_true")
     post.set_defaults(func=cmd_post)
 
@@ -993,8 +1194,21 @@ def build_parser() -> argparse.ArgumentParser:
     note_group.add_argument("--body")
     note_group.add_argument("--body-file")
     note.add_argument("--tag", action="append", default=[])
+    note.add_argument("--wait", action="store_true", help="Wait for the GitHub commit instead of returning immediately.")
     note.add_argument("--json", action="store_true")
     note.set_defaults(func=cmd_note)
+
+    outbox = commands.add_parser("outbox", help="Inspect queued and recently delivered messages.")
+    outbox.add_argument("--limit", type=int, default=5)
+    outbox.add_argument("--json", action="store_true")
+    outbox.set_defaults(func=cmd_outbox)
+
+    flush = commands.add_parser("flush", help="Start the detached delivery worker again.")
+    flush.set_defaults(func=cmd_flush)
+
+    worker = commands.add_parser("worker", help="Run the outbox delivery worker in the foreground.")
+    worker.add_argument("--quiet", action="store_true")
+    worker.set_defaults(func=cmd_worker)
 
     sync = commands.add_parser("sync", help="Refresh the local board cache.")
     sync.set_defaults(func=cmd_sync)
