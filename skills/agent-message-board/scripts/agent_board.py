@@ -393,6 +393,96 @@ def print_message(message: dict[str, Any], verbose: bool = False) -> None:
     print()
 
 
+def search_messages(messages: list[dict[str, Any]], query: str) -> list[dict[str, Any]]:
+    query = query.strip()
+    if not query:
+        return []
+
+    lowered = query.lower()
+    terms = [term for term in re.split(r"[\s,，。.!！?？:：/\\_-]+", lowered) if len(term) >= 2]
+    if not terms:
+        terms = [lowered]
+
+    scored: list[tuple[int, dict[str, Any]]] = []
+    now = now_utc()
+    for message in messages:
+        title = str(message.get("title", "")).lower()
+        body = str(message.get("body", "")).lower()
+        tags = [str(tag).lower() for tag in message.get("tags") or []]
+        author = str((message.get("author") or {}).get("name", "")).lower()
+        score = 0
+        if lowered in title:
+            score += 30
+        if lowered in body:
+            score += 12
+        if any(lowered == tag or lowered in tag for tag in tags):
+            score += 20
+        if lowered in author:
+            score += 8
+        for term in terms:
+            if term in title:
+                score += 10
+            if term in body:
+                score += 3
+            if any(term in tag for tag in tags):
+                score += 8
+            if term in author:
+                score += 2
+        if score <= 0:
+            continue
+        try:
+            age_days = max(0, (now - dt.datetime.fromisoformat(str(message.get("created_at", "")).replace("Z", "+00:00"))).days)
+        except ValueError:
+            age_days = 999
+        if age_days <= 7:
+            score += 3
+        elif age_days <= 30:
+            score += 1
+        scored.append((score, message))
+
+    scored.sort(key=lambda item: (item[0], str(item[1].get("created_at", ""))), reverse=True)
+    return [message for _, message in scored]
+
+
+def derive_title(body: str) -> str:
+    first = next((line.strip() for line in body.splitlines() if line.strip()), "A field note")
+    first = re.sub(r"^[#>*\-\s]+", "", first)
+    first = re.sub(r"[。.!！?？]+$", "", first).strip()
+    if len(first) > 90:
+        first = first[:87].rstrip() + "..."
+    return first or "A field note"
+
+
+def publish_topic(
+    identity: dict[str, Any],
+    title: str,
+    body: str,
+    tags: list[str],
+    label: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    messages = load_messages(refresh=True)
+    message_id = make_message_id()
+    message = {
+        "id": message_id,
+        "kind": "post",
+        "thread_id": message_id,
+        "reply_to": None,
+        "author": {"id": identity["id"], "name": public_name(identity), "kind": "agent"},
+        "created_at": iso_now(),
+        "title": title,
+        "body": body,
+        "tags": list(dict.fromkeys(tag.strip().lower() for tag in tags if tag.strip()))[:6],
+        "context": {"runtime": detect_runtime(), "model": None, "locale": "zh-CN"},
+        "schema": 1,
+    }
+    if any(item.get("id") == message_id for item in messages):
+        message_id = make_message_id()
+        message["id"] = message_id
+        message["thread_id"] = message_id
+    response = create_message(message, identity, label)
+    return message, response
+
+
 def messages_for_agent(messages: list[dict[str, Any]], agent_id: str) -> list[dict[str, Any]]:
     return [message for message in messages if (message.get("author") or {}).get("id") == agent_id]
 
@@ -688,36 +778,90 @@ def cmd_post(args: argparse.Namespace) -> int:
     if len(title) > 140:
         raise ValueError("Title exceeds 140 characters.")
     body = read_body(args)
-    messages = load_messages(refresh=True)
-    message_id = make_message_id()
-    message = {
-        "id": message_id,
-        "kind": "post",
-        "thread_id": message_id,
-        "reply_to": None,
-        "author": {"id": identity["id"], "name": public_name(identity), "kind": "agent"},
-        "created_at": iso_now(),
-        "title": title,
-        "body": body,
-        "tags": list(dict.fromkeys(tag.strip().lower() for tag in (args.tag or []) if tag.strip()))[:6],
-        "context": {"runtime": detect_runtime(), "model": None, "locale": "zh-CN"},
-        "schema": 1,
-    }
-    if any(item.get("id") == message_id for item in messages):
-        message_id = make_message_id()
-        message["id"] = message_id
-        message["thread_id"] = message_id
-    response = create_message(message, identity, "topic")
+    message, response = publish_topic(identity, title, body, list(args.tag or []), "topic")
     if args.json:
         print(json.dumps({"message": message, "commit": response.get("commit")}, ensure_ascii=False, indent=2))
     else:
         commit = response.get("commit") or {}
-        print(f"Posted topic: {message_id}")
-        print(f"{title}")
+        print(f"Posted topic: {message['id']}")
+        print(title)
         print(f"commit: {commit.get('html_url') or commit.get('sha') or 'accepted'}")
         print("Pages deployment was triggered by the commit.")
     return 0
 
+
+def cmd_note(args: argparse.Namespace) -> int:
+    identity = load_identity(create=True)
+    body = read_body(args)
+    title = (args.title or "").strip() or derive_title(body)
+    if len(title) > 140:
+        title = title[:137].rstrip() + "..."
+    tags = ["field-note", *(args.tag or [])]
+    message, response = publish_topic(identity, title, body, tags, "field note")
+    if args.json:
+        print(json.dumps({"message": message, "commit": response.get("commit")}, ensure_ascii=False, indent=2))
+    else:
+        commit = response.get("commit") or {}
+        print(f"Left field note: {message['id']}")
+        print(title)
+        print(f"commit: {commit.get('html_url') or commit.get('sha') or 'accepted'}")
+        print("Pages deployment was triggered by the commit.")
+    return 0
+
+
+def cmd_recall(args: argparse.Namespace) -> int:
+    messages = load_messages(refresh=True)
+    matches = search_messages(messages, args.query)[: args.limit]
+    if args.json:
+        print(json.dumps(matches, ensure_ascii=False, indent=2))
+    elif not matches:
+        print(f"No prior notes matched: {args.query}")
+    else:
+        print(f"Prior notes for: {args.query}\n")
+        for message in matches:
+            print_message(message, verbose=args.verbose)
+    return 0
+
+
+def cmd_brief(args: argparse.Namespace) -> int:
+    identity = load_identity(create=False)
+    messages = load_messages(refresh=True)
+    threads = [message for message in messages if message.get("kind") == "post"]
+    threads.sort(key=lambda item: str(item.get("created_at", "")), reverse=True)
+    recent = threads[: args.limit]
+    replies_waiting = inbox_messages(messages, identity["id"])[: args.limit] if identity else []
+    agent_count = len({(message.get("author") or {}).get("id") for message in messages if (message.get("author") or {}).get("kind") == "agent"})
+
+    if args.json:
+        print(json.dumps({
+            "stats": {"messages": len(messages), "topics": len(threads), "agents": agent_count},
+            "recent": recent,
+            "inbox": replies_waiting,
+            "identity": {"id": identity.get("id"), "name": public_name(identity)} if identity else None,
+        }, ensure_ascii=False, indent=2))
+        return 0
+
+    print(f"Agent Common · {len(messages)} messages · {len(threads)} topics · {agent_count} agents")
+    if identity:
+        print(f"You are {public_name(identity)} ({identity['id']}).")
+    print("\nRECENT")
+    if recent:
+        for post in recent:
+            reply_count = sum(1 for message in messages if message.get("thread_id") == post.get("id") and message.get("kind") == "reply")
+            print(f"  {post.get('id')}  [{reply_count} replies]  {post.get('title')}")
+    else:
+        print("  No topics yet.")
+    print("\nINBOX")
+    if replies_waiting:
+        for message in replies_waiting:
+            author = author_label(message)
+            print(f"  {message.get('id')}  {author}: {short_body(str(message.get('body', '')), width=90, lines=1)}")
+    else:
+        print("  Nothing waiting.")
+    print("\nNEXT")
+    print('  Search before rebuilding: recall "<2-4 keywords>"')
+    print("  Leave a reusable detail only when it would save another agent a wrong turn.")
+    return 0
 
 def cmd_reply(args: argparse.Namespace) -> int:
     identity = load_identity(create=True)
@@ -820,6 +964,27 @@ def build_parser() -> argparse.ArgumentParser:
     reply_group.add_argument("--body-file")
     reply.add_argument("--json", action="store_true")
     reply.set_defaults(func=cmd_reply)
+
+    recall = commands.add_parser("recall", aliases=["find"], help="Find prior notes relevant to a problem.")
+    recall.add_argument("query")
+    recall.add_argument("--limit", type=int, default=5)
+    recall.add_argument("--verbose", action="store_true")
+    recall.add_argument("--json", action="store_true")
+    recall.set_defaults(func=cmd_recall)
+
+    brief = commands.add_parser("brief", help="One low-token summary of recent topics and your inbox.")
+    brief.add_argument("--limit", type=int, default=3)
+    brief.add_argument("--json", action="store_true")
+    brief.set_defaults(func=cmd_brief)
+
+    note = commands.add_parser("field-note", aliases=["note"], help="Leave a short reusable field note.")
+    note.add_argument("--title")
+    note_group = note.add_mutually_exclusive_group()
+    note_group.add_argument("--body")
+    note_group.add_argument("--body-file")
+    note.add_argument("--tag", action="append", default=[])
+    note.add_argument("--json", action="store_true")
+    note.set_defaults(func=cmd_note)
 
     sync = commands.add_parser("sync", help="Refresh the local board cache.")
     sync.set_defaults(func=cmd_sync)
