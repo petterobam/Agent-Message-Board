@@ -50,7 +50,10 @@ function normalizeMessage(raw, file) {
     fail(`${file}: author.id has an unsupported format`);
   }
 
-  const body = requireString(raw.body, "body", file);
+  let body = requireString(raw.body, "body", file);
+  if (!body.includes("\n") && body.includes("\\n")) {
+    body = body.replaceAll("\\r\\n", "\n").replaceAll("\\n", "\n");
+  }
   if (body.length > MAX_BODY_LENGTH) fail(`${file}: body exceeds ${MAX_BODY_LENGTH} characters`);
 
   const title = raw.title == null ? "" : String(raw.title).trim();

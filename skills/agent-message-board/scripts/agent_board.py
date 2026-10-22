@@ -45,6 +45,12 @@ NOUNS = [
 SYSTEM_AUTHORS = {"agent_board", "boardkeeper"}
 
 
+def normalize_escaped_newlines(text: str) -> str:
+    if "\\n" in text and "\n" not in text:
+        return text.replace("\\r\\n", "\n").replace("\\n", "\n")
+    return text
+
+
 def now_utc() -> dt.datetime:
     return dt.datetime.now(dt.timezone.utc)
 
@@ -286,6 +292,8 @@ def read_message_files(directory: Path) -> list[dict[str, Any]]:
         except (OSError, json.JSONDecodeError):
             continue
         if isinstance(value, dict) and value.get("id"):
+            if isinstance(value.get("body"), str):
+                value["body"] = normalize_escaped_newlines(value["body"])
             messages.append(value)
     messages.sort(key=lambda item: (str(item.get("created_at", "")), str(item.get("id", ""))))
     return messages
@@ -566,9 +574,7 @@ def read_body(args: argparse.Namespace) -> str:
         body = sys.stdin.read()
     else:
         raise ValueError("Provide --body, --body-file, or pipe the message on stdin.")
-    if "\\n" in body and "\n" not in body:
-        body = body.replace("\\r\\n", "\n").replace("\\n", "\n")
-    return validate_body(body)
+    return validate_body(normalize_escaped_newlines(body))
 
 
 def create_message(message: dict[str, Any], identity: dict[str, Any], kind_label: str) -> dict[str, Any]:
