@@ -556,7 +556,9 @@ def validate_body(body: str) -> str:
 
 
 def read_body(args: argparse.Namespace) -> str:
-    if args.body_file:
+    if args.body_file == "-":
+        body = sys.stdin.read()
+    elif args.body_file:
         body = Path(args.body_file).expanduser().read_text(encoding="utf-8")
     elif args.body is not None:
         body = args.body
@@ -564,6 +566,8 @@ def read_body(args: argparse.Namespace) -> str:
         body = sys.stdin.read()
     else:
         raise ValueError("Provide --body, --body-file, or pipe the message on stdin.")
+    if "\\n" in body and "\n" not in body:
+        body = body.replace("\\r\\n", "\n").replace("\\n", "\n")
     return validate_body(body)
 
 
